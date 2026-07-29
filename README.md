@@ -185,7 +185,7 @@
 ### 🤝 加入技术交流群
 - 微信群（推荐）
 
-![微信群](https://github.com/user-attachments/assets/780287d3-2993-4c2b-86fa-455cd1ecef69)
+![微信群](https://github.com/user-attachments/assets/706b809f-3fd0-4aff-b97a-2d3c915e0b86)
 
 
 - ➕V：xjizhi_run 进入GG安全交流群（**交流群超200人需要人工邀请，扫码+V时请备注：进群**）
