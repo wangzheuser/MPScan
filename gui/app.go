@@ -57,8 +57,11 @@ type AppWindow struct {
 	tagW        int                // 标签像素宽度，由 PaintPixels 动态测量后写入
 
 	// 浮动提示窗口
-	tipWin   *walk.MainWindow
-	tipShown int32 // atomic: 0=隐藏 1=显示
+	tipWin *walk.MainWindow
+	// tipPrewarmed 提示窗口是否已在创建时完成过一次离屏布局，
+	// 为 false 说明系统不支持 cloak 预热，需要在 showTip 时惰性布局
+	tipPrewarmed bool
+	tipShown     int32 // atomic: 0=隐藏 1=显示
 
 	// 业务状态
 	watcher      *core.Watcher
@@ -66,13 +69,52 @@ type AppWindow struct {
 	cacheMu      sync.RWMutex
 
 	// 日志缓冲
-	logMu        sync.Mutex
-	logLines     []string
-	lastClickAt  time.Time // 利用工具标签双击检测
+	logMu       sync.Mutex
+	logLines    []string
+	lastClickAt time.Time // 利用工具标签双击检测
 }
 
 // Run 启动应用
+// 启动时加载的规则条数，用于在日志里提示用户
+var (
+	loadedRuleTotal   int
+	loadedRuleEnabled int
+)
+
+// logRulesLoaded 在界面就绪后提示已加载的规则条数
+func (a *AppWindow) logRulesLoaded() {
+	a.appendLog(fmt.Sprintf("[*] 已加载 %d 条敏感信息规则（启用 %d 条），可在「规则管理」中修改或新增",
+		loadedRuleTotal, loadedRuleEnabled))
+}
+
+// onManageRules 打开「规则管理」窗口。规则保存后立即对后续扫描生效，
+// 已经产出的结果不会回溯，需要重新「立即扫描」。
+func (a *AppWindow) onManageRules() {
+	before := len(core.CurrentRules())
+	ShowRulesDialog(a.MainWindow)
+	after := core.CurrentRules()
+	enabled := 0
+	for _, r := range after {
+		if r.Enabled {
+			enabled++
+		}
+	}
+	if len(after) != before {
+		a.appendLog(fmt.Sprintf("[*] 规则已更新：共 %d 条，启用 %d 条（重新扫描后生效）", len(after), enabled))
+	}
+}
+
 func Run() {
+	// 载入用户规则（不存在则写出内置规则），必须在任何扫描之前完成
+	loaded := core.LoadRules()
+	loadedRuleTotal = len(loaded)
+	loadedRuleEnabled = 0
+	for _, r := range loaded {
+		if r.Enabled {
+			loadedRuleEnabled++
+		}
+	}
+
 	a := &AppWindow{
 		logLines:     make([]string, 0, 200),
 		appNameCache: make(map[string]string),
@@ -93,7 +135,7 @@ func (a *AppWindow) buildAndRun() {
 		a.MainWindow.Synchronize(func() {
 			a.setupContextMenu()
 			// 从内嵌字节加载图标：写临时文件 → 加载 HICON → 立刻删除
-			if ico := loadEmbeddedIcon(); ico != nil {
+			if ico := AppIcon(); ico != nil {
 				_ = a.MainWindow.SetIcon(ico)
 				// 创建浮动提示窗口
 				a.createTipWindow()
@@ -101,13 +143,16 @@ func (a *AppWindow) buildAndRun() {
 		})
 	}()
 
-	_, err := (MainWindow{
+	mw := MainWindow{
 		AssignTo: &a.MainWindow,
-		Title:    "MPScan小程序安全分析工具 v2.0",
+		Title:    "MPScan小程序安全分析工具 v3.0",
 		MinSize:  Size{Width: 1100, Height: 660},
 		Size:     Size{Width: 1300, Height: 780},
 		Font:     Font{Family: "Segoe UI", PointSize: 9},
 		Layout:   VBox{MarginsZero: true, SpacingZero: true},
+		// Visible:false 抑制 walk 在 Create() 末尾自动 Show()，
+		// 由下面的 cloak → Show → RequestLayout → uncloak 流程接管，消除启动白屏。
+		Visible: false,
 		Children: []Widget{
 
 			// ╔══ 顶部科技风横幅（InvalidatesOnResize 保证宽度自适应）══╗
@@ -145,7 +190,7 @@ func (a *AppWindow) buildAndRun() {
 						X: 0, Y: 0,
 						Width: updateBounds.Width - 16, Height: updateBounds.Height - 2,
 					}
-					_ = canvas.DrawTextPixels("v2.0  |  自动化反编译 + 敏感信息提取", verFont,
+					_ = canvas.DrawTextPixels("v3.0  |  自动化反编译 + 敏感信息提取", verFont,
 						walk.RGB(80, 160, 200), verRect,
 						walk.TextRight|walk.TextVCenter|walk.TextSingleLine)
 					return nil
@@ -204,6 +249,10 @@ func (a *AppWindow) buildAndRun() {
 								AssignTo:  &a.scanOnceBtn,
 								Text:      "↺ 立即扫描",
 								OnClicked: a.onScanOnce,
+							},
+							PushButton{
+								Text:      "⚙ 规则管理",
+								OnClicked: a.onManageRules,
 							},
 						},
 					},
@@ -286,15 +335,16 @@ func (a *AppWindow) buildAndRun() {
 
 							// 结果表格
 							TableView{
-								AssignTo:              &a.resultsTable,
-								AlternatingRowBG:      false,
-								ColumnsOrderable:      true,
-								MultiSelection:        false,
-								Model:                 a.resultModel,
-								CellStyler:            a.resultModel,
-								Font:                  Font{Family: "Consolas", PointSize: 9},
+								AssignTo:         &a.resultsTable,
+								AlternatingRowBG: false,
+								ColumnsOrderable: true,
+								MultiSelection:   false,
+								Model:            a.resultModel,
+								CellStyler:       a.resultModel,
+								Font:             Font{Family: "Consolas", PointSize: 9},
 								Columns: []TableViewColumn{
-									{Title: "小程序名称", Width: 118},
+									// 加宽一点给第一列的图标腾位置（图标 16px + 间距）
+									{Title: "小程序名称", Width: 140},
 									{Title: "风险", Width: 46},
 									{Title: "分类", Width: 118},
 									{Title: "键名", Width: 104},
@@ -309,83 +359,119 @@ func (a *AppWindow) buildAndRun() {
 				},
 			},
 
-				// ╔══ 状态栏 ════════════════════════════════════════╗
-				Composite{
-					Layout: HBox{
-						Margins:      Margins{Left: 6, Top: 2, Right: 0, Bottom: 2},
-						Spacing:      0,
-						MarginsZero:  false,
+			// ╔══ 状态栏 ════════════════════════════════════════╗
+			Composite{
+				Layout: HBox{
+					Margins:     Margins{Left: 6, Top: 2, Right: 0, Bottom: 2},
+					Spacing:     0,
+					MarginsZero: false,
+				},
+				Children: []Widget{
+					// 左侧弹性空间（与右侧弹性空间配合，使状态文字真正居中）
+					HSpacer{},
+					// 中间状态文字
+					Label{
+						AssignTo: &a.statusLabel,
+						Text:     "●  就绪 — 配置目录后点击「开始监控」或「立即扫描」",
+						Font:     Font{Family: "Segoe UI", PointSize: 9},
 					},
-					Children: []Widget{
-						// 左侧弹性空间（与右侧弹性空间配合，使状态文字真正居中）
-						HSpacer{},
-						// 中间状态文字
-						Label{
-							AssignTo: &a.statusLabel,
-							Text:     "●  就绪 — 配置目录后点击「开始监控」或「立即扫描」",
-							Font:     Font{Family: "Segoe UI", PointSize: 9},
+					// 右侧弹性空间
+					HSpacer{},
+					// 右下角利用工具标签（宽度由 PaintPixels 动态测量文字后自适应）
+					CustomWidget{
+						AssignTo:            &a.toolWidget,
+						MinSize:             Size{Width: 10, Height: 28},
+						MaxSize:             Size{Height: 28},
+						StretchFactor:       0,
+						InvalidatesOnResize: false,
+						PaintPixels: func(canvas *walk.Canvas, bounds walk.Rectangle) error {
+							tagText := "利用工具:API-Explorer_v2.1.0"
+							tagFont, _ := walk.NewFont("Segoe UI", 9, walk.FontBold)
+							defer tagFont.Dispose()
+							// 测量文字宽度，动态调整控件宽度
+							measured, _, _ := canvas.MeasureTextPixels(tagText, tagFont,
+								walk.Rectangle{Width: 180, Height: bounds.Height},
+								walk.TextSingleLine|walk.TextNoClip)
+							needW := measured.Width + 20
+							if a.tagW != needW {
+								a.tagW = needW
+								if a.toolWidget != nil {
+									a.toolWidget.SetMinMaxSize(
+										walk.Size{Width: needW, Height: 28},
+										walk.Size{Width: needW, Height: 28},
+									)
+								}
+							}
+							// 绘制蓝色背景
+							tagBg, _ := walk.NewSolidColorBrush(walk.RGB(0, 80, 160))
+							defer tagBg.Dispose()
+							_ = canvas.FillRectanglePixels(tagBg, bounds)
+							// 绘制白色文字
+							_ = canvas.DrawTextPixels(tagText, tagFont,
+								walk.RGB(255, 255, 255), bounds,
+								walk.TextCenter|walk.TextVCenter|walk.TextSingleLine)
+							return nil
 						},
-						// 右侧弹性空间
-						HSpacer{},
-						// 右下角利用工具标签（宽度由 PaintPixels 动态测量文字后自适应）
-						CustomWidget{
-							AssignTo:            &a.toolWidget,
-							MinSize:             Size{Width: 10, Height: 28},
-							MaxSize:             Size{Height: 28},
-							StretchFactor:       0,
-							InvalidatesOnResize: false,
-							PaintPixels: func(canvas *walk.Canvas, bounds walk.Rectangle) error {
-								tagText := "利用工具:API-Explorer_v2.1.0"
-								tagFont, _ := walk.NewFont("Segoe UI", 9, walk.FontBold)
-								defer tagFont.Dispose()
-								// 测量文字宽度，动态调整控件宽度
-								measured, _, _ := canvas.MeasureTextPixels(tagText, tagFont,
-									walk.Rectangle{Width: 180, Height: bounds.Height},
-									walk.TextSingleLine|walk.TextNoClip)
-								needW := measured.Width + 20
-								if a.tagW != needW {
-									a.tagW = needW
-									if a.toolWidget != nil {
-										a.toolWidget.SetMinMaxSize(
-											walk.Size{Width: needW, Height: 28},
-											walk.Size{Width: needW, Height: 28},
-										)
-									}
-								}
-								// 绘制蓝色背景
-								tagBg, _ := walk.NewSolidColorBrush(walk.RGB(0, 80, 160))
-								defer tagBg.Dispose()
-								_ = canvas.FillRectanglePixels(tagBg, bounds)
-								// 绘制白色文字
-								_ = canvas.DrawTextPixels(tagText, tagFont,
-									walk.RGB(255, 255, 255), bounds,
-									walk.TextCenter|walk.TextVCenter|walk.TextSingleLine)
-								return nil
-							},
-							OnMouseMove: func(x, y int, button walk.MouseButton) {
-								a.showTip()
-							},
-							OnMouseDown: func(x, y int, button walk.MouseButton) {
-								if button != walk.LeftButton {
-									return
-								}
-								now := time.Now()
-								if now.Sub(a.lastClickAt) < 500*time.Millisecond {
-									a.onToolDoubleClick()
-									a.lastClickAt = time.Time{}
-								} else {
-									a.lastClickAt = now
-								}
-							},
+						OnMouseMove: func(x, y int, button walk.MouseButton) {
+							a.showTip()
+						},
+						OnMouseDown: func(x, y int, button walk.MouseButton) {
+							if button != walk.LeftButton {
+								return
+							}
+							now := time.Now()
+							if now.Sub(a.lastClickAt) < 500*time.Millisecond {
+								a.onToolDoubleClick()
+								a.lastClickAt = time.Time{}
+							} else {
+								a.lastClickAt = now
+							}
 						},
 					},
 				},
 			},
-		}.Run())
-
-	if err != nil {
-		walk.MsgBox(nil, "启动失败", err.Error(), walk.MsgBoxIconError)
+		},
 	}
+
+	if err := mw.Create(); err != nil {
+		walk.MsgBox(nil, "启动失败", err.Error(), walk.MsgBoxIconError)
+		return
+	}
+
+	// 模型要能取到 TableView 的 DPI，图标必须按该 DPI 构造才画得出来
+	a.resultModel.tv = a.resultsTable
+
+	// ── 消除启动白屏 ────────────────────────────────────────────────
+	// 背景：walk 的 WindowBase.SetVisible() 只在目标是 Widget 时才 RequestLayout()，
+	// MainWindow 是 Form 不是 Widget，所以单纯 Show() 不会触发布局；
+	// 而 RequestLayout() 在窗口不可见时又会被直接丢弃。
+	// 因此这里用 DWM cloak：窗口对系统而言真实可见（布局/绘制正常走），
+	// 但不被合成到屏幕，等布局与首帧绘制完成后再 uncloak。
+	// cloak 失败时（老系统/合成未开启）不能依赖后面的 uncloak 回调，
+	// 否则一旦回调没跑到，窗口会永久隐身——那比闪一下严重得多。
+	hwnd := uintptr(a.MainWindow.Handle())
+	cloaked := setWindowCloak(hwnd, true)
+	a.MainWindow.Show()
+	a.MainWindow.RequestLayout() // 补上 Show() 不会做的布局
+	if !cloaked {
+		// 退化路径：正常显示，白屏可能一闪，但界面一定出得来
+		a.MainWindow.Synchronize(a.logRulesLoaded)
+		a.MainWindow.Run()
+		return
+	}
+	// Synchronize 的回调在消息循环开始处理后执行，
+	// 此时排在它前面的 WM_SIZE / WM_PAINT 已经处理完，界面已成形。
+	// 布局是在独立 goroutine 上算的（walk 的 layoutPerformer），结果由 RunSynchronized
+	// 在每次 DispatchMessage 之后回填。为避免"第一轮消息比布局结果先到"的竞态，
+	// 这里嵌套一层 Synchronize：至少经过两轮消息派发才 uncloak，此时布局与首帧都已落地。
+	a.MainWindow.Synchronize(func() {
+		a.MainWindow.Synchronize(func() {
+			setWindowCloak(hwnd, false)
+			a.logRulesLoaded()
+		})
+	})
+
+	a.MainWindow.Run()
 }
 
 // setupContextMenu 挂载结果表格右键菜单
@@ -628,6 +714,8 @@ func (a *AppWindow) runScanner(result *core.DecompileResult) {
 	if len(items) == 0 {
 		return
 	}
+	// 在扫描线程上把图标准备好并记日志，结果表绘制时只命中缓存
+	warmIconForWxID(result.WxID, a.appendLog)
 	a.syncUI(func() {
 		a.resultModel.appendItems(items)
 		a.updateStats()
@@ -749,6 +837,10 @@ func (a *AppWindow) validateDirs() (watchDir, outputDir string, ok bool) {
 		walk.MsgBox(a.MainWindow, "错误", "创建输出目录失败: "+err.Error(), walk.MsgBoxIconError)
 		return
 	}
+	// 结果表第一列的图标要从监控目录的兄弟 ico 目录取，这里记下当前目录。
+	// 「开始监控」和「立即扫描」都会走到这里，所以放这一处就够。
+	setIconSourceDir(watchDir)
+	logIconSourceState(watchDir, a.appendLog)
 	ok = true
 	return
 }
@@ -777,18 +869,23 @@ func (a *AppWindow) appendLog(msg string) {
 	ts := time.Now().Format("15:04:05")
 	line := fmt.Sprintf("[%s] %s", ts, msg)
 
+	// 最新日志放在最前面：顶部始终是刚发生的事，不用跟着滚动条追进度。
+	// 相应地，超出上限时要丢掉尾部（最旧的）而不是头部。
 	a.logMu.Lock()
-	a.logLines = append(a.logLines, line)
+	a.logLines = append(a.logLines, "")
+	copy(a.logLines[1:], a.logLines[:len(a.logLines)-1])
+	a.logLines[0] = line
 	if len(a.logLines) > maxLogLines {
-		a.logLines = a.logLines[len(a.logLines)-maxLogLines:]
+		a.logLines = a.logLines[:maxLogLines]
 	}
 	text := strings.Join(a.logLines, "\r\n")
 	a.logMu.Unlock()
 
 	a.syncUI(func() {
 		a.logEdit.SetText(text)
-		a.logEdit.SendMessage(0x00B1, ^uintptr(0), ^uintptr(0)) // EM_SETSEL 选到末尾
-		a.logEdit.SendMessage(0x00B7, 0, 0)                      // EM_SCROLLCARET
+		// 光标归零并滚到顶部，否则 SetText 后视口可能仍停在旧位置
+		a.logEdit.SendMessage(0x00B1, 0, 0) // EM_SETSEL 选到开头
+		a.logEdit.SendMessage(0x00B7, 0, 0) // EM_SCROLLCARET
 	})
 }
 
@@ -827,7 +924,37 @@ func getDefaultWatchDir() string {
 			return p
 		}
 	}
+	// 新版微信（xwechat）换了结构：
+	//   AppData\Roaming\Tencent\xwechat\radium\users\<hash>\applet\package
+	// 图标在同级的 applet\ico 下，所以默认值要落到 package 这一层。
+	if p := findXWeChatAppletPackage(); p != "" {
+		return p
+	}
 	return getExeDir()
+}
+
+// findXWeChatAppletPackage 在 xwechat 的 users 目录下找出 applet\package。
+// users 下面是账号哈希目录，数量很少，遍历一层即可；找不到返回空字符串。
+func findXWeChatAppletPackage() string {
+	roaming := os.Getenv("APPDATA")
+	if roaming == "" {
+		return ""
+	}
+	usersDir := filepath.Join(roaming, "Tencent", "xwechat", "radium", "users")
+	entries, err := os.ReadDir(usersDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pkg := filepath.Join(usersDir, e.Name(), "applet", "packages")
+		if st, err := os.Stat(pkg); err == nil && st.IsDir() {
+			return pkg
+		}
+	}
+	return ""
 }
 
 // onToolDoubleClick 双击"利用工具:API-Explorer_v2.1.0"标签时触发
@@ -843,6 +970,20 @@ func (a *AppWindow) onToolDoubleClick() {
 	go func() {
 		_ = exec.Command(apiExe).Start()
 	}()
+}
+
+var (
+	appIconOnce   sync.Once
+	appIconCached *walk.Icon
+)
+
+// AppIcon 返回内嵌的 app.ico，主窗口和各弹窗共用同一个图标。
+// 只加载一次：HICON 常驻内存，重复开弹窗不必反复写临时文件。
+func AppIcon() *walk.Icon {
+	appIconOnce.Do(func() {
+		appIconCached = loadEmbeddedIcon()
+	})
+	return appIconCached
 }
 
 // loadEmbeddedIcon 将内嵌的 app.ico 字节写入临时文件，

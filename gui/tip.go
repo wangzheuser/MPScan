@@ -9,11 +9,23 @@ import (
 	"github.com/lxn/win"
 )
 
-// createTipWindow 创建无边框浮动提示窗口（红色加粗大字）
+// createTipWindow 创建无边框浮动提示窗口（红色加粗大字）。
+//
+// 关于启动时多出一个白窗口的问题：
+// walk 的 declarative MainWindow.Create() 末尾有 `if mw.Visible != false { w.Show() }`，
+// 所以这个提示窗口在创建时会被直接显示出来——此时边框还没去掉、CustomWidget 还没绘制，
+// 用户看到的就是主界面之外的一个白框。
+//
+// 但也不能简单加个 Visible:false 就完事：walk 的布局是异步算的，
+// 窗口从没显示过的话子控件不会被布局，之后 showTip 弹出来会是个空白框。
+// 所以这里的做法是：先 cloak（DWM 不合成到屏幕）→ 显示并完成一次真实布局 → 隐藏 → uncloak。
+// 整个过程用户看不到任何窗口，而 CustomWidget 已经拿到正确尺寸，后续 showTip 直接可用。
 func (a *AppWindow) createTipWindow() {
 	err := (MainWindow{
 		AssignTo: &a.tipWin,
 		Title:    "",
+		// 抑制 Create() 末尾的自动 Show()，改由下面的 cloak 流程接管
+		Visible: false,
 		MinSize:  Size{Width: 400, Height: 54},
 		MaxSize:  Size{Width: 400, Height: 54},
 		Layout:   VBox{MarginsZero: true, SpacingZero: true},
@@ -43,10 +55,35 @@ func (a *AppWindow) createTipWindow() {
 	}
 
 	hwnd := a.tipWin.Handle()
-	// 去掉标题栏、边框，改为纯弹出层
+	// 去掉标题栏、边框，改为纯弹出层。
+	// 必须在下面那次布局用的 Show 之前做，否则会先闪一下带标题栏的样子。
 	win.SetWindowLong(hwnd, win.GWL_STYLE, int32(win.WS_BORDER))
 	win.SetWindowLong(hwnd, win.GWL_EXSTYLE,
 		int32(win.WS_EX_TOPMOST|win.WS_EX_TOOLWINDOW))
+
+	// 预热布局：cloak 住走一次真实的显示 → 布局 → 隐藏。
+	// SWP_NOACTIVATE 保证不抢主窗口焦点；移到屏幕外再加一层保险。
+	if !setWindowCloak(uintptr(hwnd), true) {
+		// 不支持 cloak 的系统上不做预热，改为 showTip 时惰性布局（见 showTip）
+		return
+	}
+	// 先挪到屏幕外并定好尺寸，再用 walk 的 Show()（而不是裸 SWP_SHOWWINDOW），
+	// 这样 walk 内部的 visible 标记与真实状态一致，后续 Hide() 行为才正确。
+	win.SetWindowPos(hwnd, win.HWND_TOPMOST, -32000, -32000, 400, 54,
+		win.SWP_NOACTIVATE|win.SWP_NOZORDER)
+	a.tipWin.Show()
+	a.tipWin.RequestLayout()
+
+	// 嵌套两层 Synchronize：walk 的布局结果由 RunSynchronized 在消息派发后回填，
+	// 两轮之后布局一定已落地，此时再藏起来并解除 cloak。
+	a.tipWin.Synchronize(func() {
+		a.tipWin.Synchronize(func() {
+			// 用 walk 的 Hide() 而不是裸 SetWindowPos，保持 walk 内部 visible 标记一致
+			a.tipWin.Hide()
+			setWindowCloak(uintptr(hwnd), false)
+			a.tipPrewarmed = true
+		})
+	})
 }
 
 // showTip 在鼠标上方显示提示窗口，并启动轮询 goroutine 监控鼠标位置
@@ -57,6 +94,12 @@ func (a *AppWindow) showTip() {
 	// CAS: 0→1，防止重复启动
 	if !atomic.CompareAndSwapInt32(&a.tipShown, 0, 1) {
 		return
+	}
+
+	// 没能在创建时预热布局的情况（系统不支持 DWM cloak）：这里惰性补一次。
+	// RequestLayout 是幂等的，多调一次没有副作用。
+	if !a.tipPrewarmed {
+		a.tipWin.RequestLayout()
 	}
 
 	var pt win.POINT

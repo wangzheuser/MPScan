@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -44,6 +43,17 @@ var DefaultOptions = DecompileOptions{
 // DecompileDir 对整个小程序目录（wx开头的文件夹）进行反编译
 // root: 形如 D:\WeChat Files\Applet\wx1234567890abcdef
 // outputBase: 输出的根目录，会在该目录下创建以wxid命名的子目录
+//
+// 微信小程序目录的常规结构：
+//
+//	wxXXX/
+//	  ├─ 0/   (主包 .wxapkg)
+//	  ├─ 1/   (分包 .wxapkg)
+//	  └─ ...
+//
+// 主包与各分包会被统一反编译到同一个 outputDir 根下，因为每个 wxapkg
+// 内部记录的文件路径已经天然区分（主包的 app.json / 分包的 pages 等），
+// 合并后即可还原一个完整的小程序文件结构，便于后续扫描与人工分析。
 func DecompileDir(root, outputBase string, opts DecompileOptions, logFunc func(string)) (*DecompileResult, error) {
 	wxid, err := parseWxid(root)
 	if err != nil {
@@ -64,27 +74,51 @@ func DecompileDir(root, outputBase string, opts DecompileOptions, logFunc func(s
 
 	logFunc(fmt.Sprintf("[+] 开始反编译 '%s'，使用 %d 个线程", filepath.Base(root), opts.Thread))
 
-	var allFileCount int
+	// 收集所有 wxapkg 文件（包括主包与分包），统一输出到 outputDir
+	type packInfo struct {
+		path string
+		// isMain 通过目录号推断主包（数字越小越靠前，"0" 视为主包）
+		isMain bool
+	}
+	var packs []packInfo
 	for _, subDir := range dirs {
-		subOutput := filepath.Join(outputDir, subDir.Name())
-		files, err := scanFiles(filepath.Join(root, subDir.Name()))
-		if err != nil {
-			// 子目录没有wxapkg文件，跳过即可
-			logFunc(fmt.Sprintf("[-] 跳过 '%s': %v", subDir.Name(), err))
+		if !subDir.IsDir() {
 			continue
 		}
-
-		for _, file := range files {
-			decryptedData := decryptFile(wxid, file)
-			fileCount, err := unpack(decryptedData, subOutput, opts.Thread, !opts.DisableBeautify)
-			if err != nil {
-				logFunc(fmt.Sprintf("[!] 解包失败 '%s': %v", filepath.Base(file), err))
-				continue
-			}
-			allFileCount += fileCount
-			rel, _ := filepath.Rel(filepath.Dir(root), file)
-			logFunc(fmt.Sprintf("[+] 已解包 %d 个文件 <- '%s'", fileCount, rel))
+		files, ferr := scanFiles(filepath.Join(root, subDir.Name()))
+		if ferr != nil {
+			logFunc(fmt.Sprintf("[-] 跳过 '%s': %v", subDir.Name(), ferr))
+			continue
 		}
+		isMain := subDir.Name() == "0" || subDir.Name() == "main"
+		for _, f := range files {
+			packs = append(packs, packInfo{path: f, isMain: isMain})
+		}
+	}
+
+	logFunc(fmt.Sprintf("[+] 共发现 %d 个 wxapkg 文件（主包+分包），统一输出到 %s", len(packs), outputDir))
+
+	var allFileCount int
+	for _, p := range packs {
+		decryptedData, derr := decryptFileSafe(wxid, p.path)
+		if derr != nil {
+			logFunc(fmt.Sprintf("[!] 解密失败 '%s': %v", filepath.Base(p.path), derr))
+			continue
+		}
+		fileCount, uerr := unpack(decryptedData, outputDir, opts.Thread, !opts.DisableBeautify)
+		if uerr != nil {
+			// 部分分包文件在解密后可能不含 0xBE/0xED 头部（例如独立分包或增量更新包），
+			// 这里给出更明确的提示而不是简单的"格式无效"。
+			logFunc(fmt.Sprintf("[!] 解包失败 '%s'（可能是非标准分包/增量包）: %v", filepath.Base(p.path), uerr))
+			continue
+		}
+		allFileCount += fileCount
+		rel, _ := filepath.Rel(filepath.Dir(root), p.path)
+		tag := "分包"
+		if p.isMain {
+			tag = "主包"
+		}
+		logFunc(fmt.Sprintf("[+] 已解包 %s %d 个文件 <- '%s'", tag, fileCount, rel))
 	}
 
 	result.FileCount = allFileCount
@@ -102,8 +136,13 @@ func DecompileSingleFile(wxapkgPath, outputDir string, opts DecompileOptions, lo
 		return nil, err
 	}
 
-	decryptedData := decryptFile(wxid, wxapkgPath)
-	subOutputDir := filepath.Join(outputDir, wxid, filepath.Base(filepath.Dir(wxapkgPath)))
+	decryptedData, err := decryptFileSafe(wxid, wxapkgPath)
+	if err != nil {
+		return nil, err
+	}
+	// 单文件反编译也直接输出到 wxid 根目录，与 DecompileDir 行为一致，
+	// 这样后续扫描 / 小程序名称解析 都可走统一逻辑。
+	subOutputDir := filepath.Join(outputDir, wxid)
 	fileCount, err := unpack(decryptedData, subOutputDir, opts.Thread, !opts.DisableBeautify)
 	if err != nil {
 		return nil, err
@@ -153,8 +192,9 @@ func scanFiles(root string) ([]string, error) {
 	return paths, nil
 }
 
-// decryptFile 解密 wxapkg 文件，返回解密后的字节数据
-func decryptFile(wxid, wxapkgPath string) []byte {
+// decryptFileSafe 解密 wxapkg 文件，返回错误而非 log.Fatal，
+// 这样一个坏文件不会拖垮整个反编译流程。
+func decryptFileSafe(wxid, wxapkgPath string) ([]byte, error) {
 	var (
 		salt = "saltiest"
 		iv   = "the iv: 16 bytes"
@@ -162,7 +202,11 @@ func decryptFile(wxid, wxapkgPath string) []byte {
 
 	dataByte, err := os.ReadFile(wxapkgPath)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+	// wxapkg 头部至少需要 6 + 1024 字节用于 AES-CBC 解密
+	if len(dataByte) < 1024+6 {
+		return nil, fmt.Errorf("文件过小（%d 字节），可能不是有效 wxapkg 或下载未完成", len(dataByte))
 	}
 
 	dk := pbkdf2.Key([]byte(wxid), []byte(salt), 1000, 32, sha1.New)
@@ -181,7 +225,7 @@ func decryptFile(wxid, wxapkgPath string) []byte {
 	}
 
 	originData = append(originData[:1023], afData...)
-	return originData
+	return originData, nil
 }
 
 type wxapkgFile struct {

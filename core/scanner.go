@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -31,149 +30,23 @@ type ScanResult struct {
 	LineNo   int
 }
 
-// sensitivePattern 匹配规则
-type sensitivePattern struct {
-	category   string
-	keyName    string
-	level      SensitiveLevel
-	regex      *regexp.Regexp
-	valueGroup int // 0=全匹配，1+=捕获组
-}
-
-var sensitivePatterns = []sensitivePattern{
-	// ══════ 微信小程序 ══════
-	{
-		category: "微信·AppSecret", keyName: "AppSecret", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?app[_-]?secret["']?\s*[:=]\s*["']([a-zA-Z0-9]{32})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "微信·支付密钥", keyName: "MchKey/PaySignKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?(?:pay[_-]?sign[_-]?key|mch[_-]?key|partner[_-]?key|paykey)["']?\s*[:=]\s*["']([a-zA-Z0-9]{32})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "微信·商户号", keyName: "MchID", level: LevelMedium,
-		regex:      regexp.MustCompile(`(?i)["']?(?:mch[_-]?id|mchid|merchant[_-]?id)["']?\s*[:=]\s*["']?(\d{8,15})["']?`),
-		valueGroup: 1,
-	},
-
-	// ══════ 腾讯云 ══════
-	{
-		category: "腾讯云·SecretId", keyName: "SecretId", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?secret[_-]?id["']?\s*[:=]\s*["']([A-Za-z0-9]{36,40})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "腾讯云·SecretKey", keyName: "SecretKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?secret[_-]?key["']?\s*[:=]\s*["']([A-Za-z0-9]{32,40})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "腾讯云·COS桶", keyName: "COSBucket", level: LevelLow,
-		regex:      regexp.MustCompile(`([\w-]+-\d{9,13}\.cos\.[a-z0-9-]+\.myqcloud\.com)`),
-		valueGroup: 1,
-	},
-	{
-		category: "腾讯云·短信", keyName: "SMSAppKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?sms[_-]?(?:app[_-]?)?key["']?\s*[:=]\s*["']([a-zA-Z0-9]{32,40})["']`),
-		valueGroup: 1,
-	},
-
-	// ══════ 阿里云 ══════
-	{
-		category: "阿里云·AccessKeyId", keyName: "AccessKeyId", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?access[_-]?key[_-]?id["']?\s*[:=]\s*["']([A-Za-z0-9]{20,24})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "阿里云·AccessKeySecret", keyName: "AccessKeySecret", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?access[_-]?key[_-]?secret["']?\s*[:=]\s*["']([A-Za-z0-9]{28,36})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "阿里云·OSS端点", keyName: "OSSEndpoint", level: LevelLow,
-		regex:      regexp.MustCompile(`([\w-]+\.oss(?:-[a-z0-9-]+)?\.aliyuncs\.com)`),
-		valueGroup: 1,
-	},
-
-	// ══════ AWS ══════
-	{
-		category: "AWS·AccessKeyId", keyName: "AccessKeyId", level: LevelHigh,
-		regex:      regexp.MustCompile(`(AKIA[0-9A-Z]{16})`),
-		valueGroup: 1,
-	},
-	{
-		category: "AWS·SecretKey", keyName: "SecretAccessKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?aws[_-]?secret[_-]?(?:access[_-]?)?key["']?\s*[:=]\s*["']([a-zA-Z0-9+/]{40})["']`),
-		valueGroup: 1,
-	},
-
-	// ══════ 七牛云 ══════
-	{
-		category: "七牛云·AccessKey", keyName: "AccessKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?(?:qiniu[_-]?)?access[_-]?key["']?\s*[:=]\s*["']([a-zA-Z0-9_\-]{40,60})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "七牛云·SecretKey", keyName: "SecretKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?(?:qiniu[_-]?)?secret[_-]?key["']?\s*[:=]\s*["']([a-zA-Z0-9_\-]{40,60})["']`),
-		valueGroup: 1,
-	},
-
-	// ══════ 华为云 ══════
-	{
-		category: "华为云·AccessKey", keyName: "HWAccessKey", level: LevelHigh,
-		regex:      regexp.MustCompile(`(?i)["']?hw[_-]?access[_-]?key["']?\s*[:=]\s*["']([A-Z0-9]{20})["']`),
-		valueGroup: 1,
-	},
-
-	// ══════ 数据库 ══════
-	{
-		category: "数据库·MongoDB", keyName: "MongoDB URL", level: LevelHigh,
-		regex:      regexp.MustCompile(`(mongodb(?:\+srv)?://[^\s"'<>\]]{10,})`),
-		valueGroup: 1,
-	},
-	{
-		category: "数据库·MySQL", keyName: "MySQL URL", level: LevelHigh,
-		regex:      regexp.MustCompile(`(mysql://[^\s"'<>\]]{10,})`),
-		valueGroup: 1,
-	},
-	{
-		category: "数据库·Redis", keyName: "Redis URL", level: LevelMedium,
-		regex:      regexp.MustCompile(`(redis://[^\s"'<>\]]{6,})`),
-		valueGroup: 1,
-	},
-
-	// ══════ 通用 ══════
-	{
-		category: "通用·APIKey", keyName: "ApiKey", level: LevelMedium,
-		regex:      regexp.MustCompile(`(?i)["']?api[_-]?key["']?\s*[:=]\s*["']([a-zA-Z0-9_\-]{16,64})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "通用·Token", keyName: "Token/AuthToken", level: LevelMedium,
-		regex:      regexp.MustCompile(`(?i)["']?(?:auth[_-]?)?token["']?\s*[:=]\s*["']([a-zA-Z0-9_\-\.]{24,128})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "通用·密码", keyName: "Password", level: LevelMedium,
-		regex:      regexp.MustCompile(`(?i)["']?(?:password|passwd|pwd)["']?\s*[:=]\s*["']([^"']{6,32})["']`),
-		valueGroup: 1,
-	},
-	{
-		category: "服务器·内网IP", keyName: "PrivateIP", level: LevelLow,
-		regex:      regexp.MustCompile(`["'/]((?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3})(?::\d+)?["'/]`),
-		valueGroup: 1,
-	},
-}
+// 敏感信息匹配规则已抽到 rules.go，支持在 UI 的「规则管理」中修改和新增，
+// 内置默认规则见 DefaultRules，运行时生效的规则通过 activeRules() 获取。
 
 // 要扫描的文件后缀
 var scanExtensions = map[string]bool{
 	".js": true, ".json": true, ".ts": true, ".wxs": true,
 }
 
-const maxFileSize = 2 * 1024 * 1024 // 2MB，超过跳过
+const (
+	// 反编译出来的 app-service.js 动辄十几 MB，旧的 2MB 上限会把这些文件整个跳过，
+	// 而 AK/SK 这类东西恰好最常出现在里面，所以把上限抬到 64MB 并在跳过时记日志。
+	maxFileSize = 64 * 1024 * 1024
+
+	// 单行、单条规则最多取的匹配数。压缩后的 JS 一行可能有几 MB，
+	// 全量取匹配在极端情况下会产生大量重复结果，这里留个上限。
+	maxMatchesPerLine = 500
+)
 
 // ScanDecompiledDir 扫描反编译目录，提取敏感信息
 func ScanDecompiledDir(wxid, appName, decompiledDir string, logFunc func(string)) []*ScanResult {
@@ -193,6 +66,9 @@ func ScanDecompiledDir(wxid, appName, decompiledDir string, logFunc func(string)
 			return nil
 		}
 		if info.Size() > maxFileSize {
+			// 不再静默跳过，否则漏报时完全没有线索
+			logFunc(fmt.Sprintf("[!] 文件过大已跳过（%.1fMB > %dMB）：%s",
+				float64(info.Size())/(1024*1024), maxFileSize/(1024*1024), path))
 			return nil
 		}
 		results = append(results, scanFile(path, wxid, appName, seen)...)
@@ -225,51 +101,65 @@ func scanFile(path, wxid, appName string, seen map[string]bool) []*ScanResult {
 	}
 	defer f.Close()
 
+	// 取一次规则快照，避免扫描过程中用户保存规则导致中途换表
+	rules := activeRules()
+
 	var results []*ScanResult
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
+
+	// 用 bufio.Reader 逐行读，不能用 bufio.Scanner：Scanner 的单行上限（之前是 1MB）
+	// 一旦被压缩成一整行的 JS 顶破，Scan() 会直接返回 false，文件剩下的部分全部不扫，
+	// 而且不报错。ReadString 没有这个限制。
+	rd := bufio.NewReaderSize(f, 1<<20)
 
 	lineNo := 0
-	for sc.Scan() {
+	for {
+		line, err := rd.ReadString('\n')
+		if line == "" && err != nil {
+			break
+		}
 		lineNo++
-		line := sc.Text()
+		line = strings.TrimRight(line, "\r\n")
 
-		for _, pat := range sensitivePatterns {
-			matches := pat.regex.FindStringSubmatch(line)
-			if matches == nil {
-				continue
-			}
-			var value string
-			if pat.valueGroup == 0 || pat.valueGroup >= len(matches) {
-				value = matches[0]
-			} else {
-				value = matches[pat.valueGroup]
-			}
-			if value == "" {
-				continue
-			}
+		for _, pat := range rules {
+			// 一行里可能有多组 AK/SK（压缩后的 JS 尤其常见），
+			// 只取第一个匹配会漏掉后面的，所以取全部匹配。
+			for _, matches := range pat.regex.FindAllStringSubmatch(line, maxMatchesPerLine) {
+				var value string
+				if pat.ValueGroup == 0 || pat.ValueGroup >= len(matches) {
+					value = matches[0]
+				} else {
+					value = matches[pat.ValueGroup]
+				}
+				if value == "" {
+					continue
+				}
 
-			key := pat.category + ":" + value
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
+				key := pat.Category + ":" + value
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
 
-			display := value
-			if len(display) > 80 {
-				display = display[:77] + "..."
-			}
+				display := value
+				if len(display) > 80 {
+					display = display[:77] + "..."
+				}
 
-			results = append(results, &ScanResult{
-				WxID:     wxid,
-				AppName:  appName,
-				Category: pat.category,
-				Level:    pat.level,
-				KeyName:  pat.keyName,
-				Value:    display,
-				FilePath: path,
-				LineNo:   lineNo,
-			})
+				results = append(results, &ScanResult{
+					WxID:     wxid,
+					AppName:  appName,
+					Category: pat.Category,
+					Level:    LevelFromString(pat.Level),
+					KeyName:  pat.KeyName,
+					Value:    display,
+					FilePath: path,
+					LineNo:   lineNo,
+				})
+			}
+		}
+
+		if err != nil {
+			break
 		}
 	}
 	return results
