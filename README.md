@@ -134,11 +134,6 @@
 
 ![图片](https://github.com/user-attachments/assets/3e12732e-a001-4963-a75f-1e1821000f8e)
   
----
-
-## ⭐ Star History
-
-![Star History Chart](https://api.star-history.com/svg?repos=i-am-xjizhi/MPScan&type=date&v=3)
 
 ---
 
